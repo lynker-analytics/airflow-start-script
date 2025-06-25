@@ -48,7 +48,7 @@ Worker processes (celery based) can be started on each node and the log/pid file
 
 The script offers a work-around for:
 
-* dag-processor doesn't like being daemonized (#50038)[https://github.com/apache/airflow/issues/50038]- so we do the nohup in python and create the PID file.
+* dag-processor doesn't like being daemonized [#50038](https://github.com/apache/airflow/issues/50038) - so we do the nohup in python and create the PID file.
 * api-server doesn't write a PID file - so we find the PID with `psutil`.
 
 So, please feel free to fork the repo/copy/cherry-pick what you like.
