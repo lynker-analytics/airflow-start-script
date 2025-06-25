@@ -32,6 +32,8 @@ Start a GPU celery queue on a worker (i.e. only one process at the time):
 $ python airflow_services.py start worker-gpu
 ```
 
+The stop command will use `airflow celery stop` to stop the worker gracefully.
+
 A little bit of help:
 
 ```bash
@@ -45,7 +47,7 @@ options:
   -h, --help            show this help message and exit
 ```
 
-The script works well in the same environment as the airflow installation, it requires `psutils` and does not try to select other enviroments.
+The script works well in the same environment as the airflow installation (i.e it expects "airflow" on the `PATH`), it requires `psutil` and does not try to select other enviroments.
 
 ## Assumptions
 
