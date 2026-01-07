@@ -47,7 +47,12 @@ options:
   -h, --help            show this help message and exit
 ```
 
-The script works well in the same environment as the airflow installation (i.e it expects "airflow" on the `PATH`), it requires `psutil` and does not try to select other enviroments.
+The script works well in the same environment as the airflow installation (i.e it expects "airflow" on the `PATH`).
+
+PID and log files will be written into `$AIRFLOW_HOME/service-logs`.
+
+The script does not use the "daemon mode" as this lead to problems with the `epoll` method of the `select` module for the dag-processor service and the celery workers.
+Each service process is started with a `nohup` like procedure.
 
 ## Assumptions
 
@@ -56,13 +61,8 @@ We have a head/main node, which runs api-server, triggerer, scheduler and dag-pr
 The worker nodes have the `AIRFLOW_HOME` directory mounted, so the configuration, DAGS and scripts are shared.
 
 The celery executor distributes workloads and the [airflow conda operator](ttps://github.com/lynker-analytics/airflow-conda-operator/)
-to coordinate different runtime environments.
+to manage the different runtime environments on each host.
 
 Worker processes (celery based) can be started on each node and the log/pid file names include the nodes' hostname.
-
-The script offers a work-around for:
-
-* dag-processor doesn't like being daemonized [#50038](https://github.com/apache/airflow/issues/50038) - so we do the nohup in python and create the PID file.
-* api-server doesn't write a PID file - so we find the PID with `psutil`.
 
 So, please feel free to fork the repo/copy/cherry-pick what you like.

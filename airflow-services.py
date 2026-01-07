@@ -15,8 +15,8 @@ import signal
 import socket
 import subprocess
 import time
+import errno
 
-import psutil
 
 AIRFLOW_HOME = pathlib.Path(
     os.environ.get("AIRFLOW_HOME", pathlib.Path.home() / "airflow")
@@ -33,7 +33,7 @@ ALL_SERVICES = [
     "scheduler",
     "triggerer",
     "dag-processor",
-    # add more worker types here
+    # add more worker types here?
     "worker",
     "worker-gpu",
 ]
@@ -52,48 +52,47 @@ def pid_file_location(
     return SERVICES_DIR / f"{service_name}{hostname_suffix}.pid"
 
 
-def start_service(service_name: str):
-    # for scheduler and triggerer (and dag-processor in future)
-    # todo: add hostname for multiple schedulers/triggerers
-    assert not check_service(service_name)
+def check_pid_exists(pid: int) -> int | None:
+    """
+    Test whether the process id still exists (and permission to send signals to it).
 
-    pid_file = pid_file_location(service_name)
-    subprocess.check_call(
-        [
-            "airflow",
-            service_name,
-            "--daemon",
-            "--pid",
-            str(pid_file),
-            "--log-file",
-            str(SERVICES_DIR / f"{service_name}.log"),
-            "--stdout",
-            str(SERVICES_DIR / f"{service_name}.out"),
-            "--stderr",
-            str(SERVICES_DIR / f"{service_name}.err"),
-        ],
-        cwd=str(AIRFLOW_HOME),
-        env=os.environ | {"AIRFLOW_HOME": str(AIRFLOW_HOME)},
-        stdout=subprocess.DEVNULL,
-    )
+    :param pid: process id
+    :type pid: int
+    :return: returns process id if process still exists, otherwise None
+    :rtype: int | None
+    """
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        if e.errno == errno.ESRCH:
+            return  # No such process
+        raise
+    return pid  # still there
 
-    for _ in range(10):
-        if pid_file.is_file():
-            break
+
+def wait_pid_timeout(pid: int, timeout_seconds: float) -> int | None:
+    """
+    Waits for a process ID (pid) to stop existing with a timeout.
+    Returns None if pid doesn't exist, otherwise pid.
+    """
+    start_time = time.time()
+    while time.time() - start_time < timeout_seconds:
+        if check_pid_exists(pid) is None:
+            return
+
+        # Sleep briefly to avoid busy-waiting
         time.sleep(0.1)
-    else:
-        print(f"start of {service_name} failed")
+
+    return check_pid_exists(pid)
 
 
 def stop_service(service_name: str):
     pid = check_service(service_name)
 
     if pid:
-        proc = psutil.Process(pid)
-        proc.terminate()
-        proc.wait(10)
+        os.kill(pid, signal.SIGTERM)
 
-        if psutil.pid_exists(pid):
+        if wait_pid_timeout(pid, 10) is not None:
             print("failed to end process")
             return
 
@@ -107,25 +106,22 @@ def check_service(service_name: str, hostname=None):
     if pid_file.is_file():
         with open(pid_file, mode="rt") as pid_text:
             pid = int(pid_text.readline().strip())
-        if psutil.pid_exists(pid):
-            return pid
-        print("removing stale PID file")
-        pid_file.unlink()
+
+        if check_pid_exists(pid) is None:
+            print("removing stale PID file")
+            pid_file.unlink()
+            return
+
+        return pid
 
 
-### handle DAG processor and api service specially
-
-
-def start_dag_processor():
-    # the DAG processor doesn't like the daemon mode, so starting with "nohup"
-
-    service_name = "dag-processor"
+def start_service(service_name: str, start_args=None, add_hostname=None):
     assert not check_service(service_name)
 
     new_proc = os.fork()
 
     if new_proc != 0:
-        pid_file = pid_file_location(service_name)
+        pid_file = pid_file_location(service_name, add_hostname)
         with open(pid_file, mode="wt") as pid_text:
             pid_text.write(str(new_proc))
 
@@ -149,11 +145,14 @@ def start_dag_processor():
     )
     os.dup2(err_fd, 2)
 
+    if start_args is None:
+        start_args = [service_name]
+
     os.execvpe(
         file="airflow",
         args=[
             "airflow",
-            "dag-processor",
+            *start_args,
             # probably doesn't do anything wo daemon mode
             "--log-file",
             str(SERVICES_DIR / f"{service_name}.log"),
@@ -161,91 +160,6 @@ def start_dag_processor():
         env=os.environ | {"AIRFLOW_HOME": str(AIRFLOW_HOME)},
     )
     # no return from here!
-
-
-def start_api_server():
-    # the API server doesn't write a PID file
-    service_name = "api-server"
-
-    assert not find_api_server()
-    pid_file = pid_file_location(service_name)
-
-    subprocess.check_call(
-        [
-            "airflow",
-            "api-server",
-            "--daemon",
-            "--access-logfile",
-            str(SERVICES_DIR / f"{service_name}.access"),
-            # these don't do anything at the moment ?!
-            "--pid",
-            str(pid_file),
-            "--log-file",
-            str(SERVICES_DIR / f"{service_name}.log"),
-            "--stdout",
-            str(SERVICES_DIR / f"{service_name}.out"),
-            "--stderr",
-            str(SERVICES_DIR / f"{service_name}.err"),
-        ],
-        cwd=str(AIRFLOW_HOME),
-        env=os.environ | {"AIRFLOW_HOME": str(AIRFLOW_HOME)},
-        stdout=subprocess.DEVNULL,
-    )
-
-    for _ in range(10):
-        # work around the lack of a pid file
-        server_pid = find_api_server()
-        if server_pid:
-            with open(pid_file, mode="wt") as pid_file:
-                pid_file.write(str(server_pid))
-            return server_pid
-        time.sleep(0.1)
-    else:
-        print(f"start of {service_name} failed")
-        if pid_file.is_file():
-            pid_file.unlink()
-        return
-
-
-def stop_api_server():
-
-    pid = check_api_server()
-
-    if pid:
-        proc = psutil.Process(pid)
-        proc.terminate()
-        proc.wait(10)
-        if psutil.pid_exists(pid):
-            print("failed to end process")
-            return
-
-    pid_file = pid_file_location("api-server")
-    if pid_file.is_file():
-        pid_file.unlink()
-
-
-def find_api_server() -> int | None:
-    """
-    find API server PID with psutil
-    """
-    for proc in psutil.process_iter():
-        if proc.uids().real != os.getuid():
-            continue
-        proc_name = proc.name()
-        if proc_name and proc_name.startswith("airflow api_server"):
-            return proc.pid
-
-
-def check_api_server() -> int | None:
-    pid = check_service("api-server")
-    if not pid:
-        pid = find_api_server()
-        if pid:
-            pid_file = pid_file_location("api-server")
-            with open(pid_file, mode="wt") as pid_file:
-                pid_file.write(str(pid))
-
-    return pid
 
 
 ### workers (per host/pool/queue)
@@ -262,20 +176,9 @@ def start_worker(worker_type="default"):
     # todo: add hostname for multiple schedulers/triggerers
     assert not check_service(service_name)
 
-    pid_file = pid_file_location(service_name, hostname=True)
     worker_start_args = [
-        "airflow",
         "celery",
         "worker",
-        "--daemon",
-        "--pid",
-        str(pid_file),
-        "--log-file",
-        str(SERVICES_DIR / f"{service_name}-{HOSTNAME}.log"),
-        "--stdout",
-        str(SERVICES_DIR / f"{service_name}-{HOSTNAME}.out"),
-        "--stderr",
-        str(SERVICES_DIR / f"{service_name}-{HOSTNAME}.err"),
     ]
     if worker_type == "default":
         worker_start_args.extend(
@@ -298,19 +201,15 @@ def start_worker(worker_type="default"):
     else:
         raise ValueError(f"unexpected worker type {worker_type}")
 
-    subprocess.check_call(
-        worker_start_args,
-        cwd=str(AIRFLOW_HOME),
-        env=os.environ | {"AIRFLOW_HOME": str(AIRFLOW_HOME)},
-        stdout=subprocess.DEVNULL,
-    )
+    start_service(service_name, worker_start_args, add_hostname=True)
 
+    pid_file = pid_file_location(service_name, hostname=True)
     for _ in range(10):
         if pid_file.is_file():
             return check_service(service_name, True)
         time.sleep(0.1)
     else:
-        print(f"start of {service_name}@{HOSTNAME} failed")
+        print(f"failed to start {service_name}@{HOSTNAME}")
 
 
 def stop_worker(worker_type="default"):
@@ -341,20 +240,20 @@ def stop_worker(worker_type="default"):
             break
         time.sleep(0.1)
     else:
-        print(f"start of {service_name}@{HOSTNAME} failed")
+        print(f"failed to stop {service_name}@{HOSTNAME}")
 
 
 ### the CLI commands
 
 
-def check_status(_):
+def check_status(args=None):
     def report_status(service_name, pid):
-        if pid:
-            print(service_name, f"up (pid={pid})")
+        if pid is not None:
+            print(f"{service_name} up (pid={pid})")
         else:
-            print(service_name, "down")
+            print(f"{service_name} down")
 
-    report_status("api-server", check_api_server())
+    report_status("api-server", check_service("api-server"))
     report_status("scheduler", check_service("scheduler"))
     report_status("triggerer", check_service("triggerer"))
     report_status("dag-processor", check_service("dag-processor"))
@@ -369,7 +268,7 @@ def stop(args):
         services = ["api-server", "scheduler", "triggerer", "dag-processor"]
 
     if "api-server" in services:
-        stop_api_server()
+        stop_service("api-server")
     if "scheduler" in services:
         stop_service("scheduler")
     if "triggerer" in services:
@@ -392,13 +291,13 @@ def start(args):
         services = ["api-server", "scheduler", "triggerer", "dag-processor"]
 
     if "api-server" in services:
-        start_api_server()
+        start_service("api-server")
     if "scheduler" in services:
         start_service("scheduler")
     if "triggerer" in services:
         start_service("triggerer")
     if "dag-processor" in services:
-        start_dag_processor()
+        start_service("dag-processor")
 
     for service in services:
         if service.startswith("worker"):
@@ -407,6 +306,8 @@ def start(args):
                 start_worker()
             else:
                 start_worker(worker_type)
+
+    check_status()
 
 
 if __name__ == "__main__":
